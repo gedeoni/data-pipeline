@@ -57,6 +57,11 @@ class OrderSeeder:
             return cid
         return 0
 
+    def _log_ctx(self, company: Company | None = None) -> str:
+        if company:
+            return f"[orders][{company.country_code}][{company.name}][{self.dataset_key}]"
+        return f"[orders][{self.dataset_key}]"
+
     def _get_move_line_done_field(self) -> str:
         """Return the done qty field for stock.move.line (Odoo 17 uses `quantity`)."""
         if self._move_line_done_field:
@@ -184,8 +189,10 @@ class OrderSeeder:
         stats = {"po_count": 0, "so_count": 0, "po_lines": 0, "so_lines": 0}
         sku_outbound_counts = defaultdict(int)
 
+        _logger.info("%s Seeding orders for %s", self._log_ctx(company), company.name)
+
         if not products:
-            _logger.warning("No products provided; skipping order seeding.")
+            _logger.warning("%s No products provided; skipping order seeding.", self._log_ctx(company))
             return {
                 "pickings_csv": "N/A (Orders Mode)",
                 "moves_csv": "N/A (Orders Mode)",
@@ -209,7 +216,7 @@ class OrderSeeder:
                 "lowest_days_of_cover": [],
             }
 
-        _logger.info("Seeding orders from %s to %s...", days_list[0], days_list[-1])
+        _logger.info("%s Seeding orders from %s to %s...", self._log_ctx(company), days_list[0], days_list[-1])
 
         # Fetch warehouse details (IDs, Input Picking Types, Stock Locations)
         warehouses = []
@@ -226,6 +233,8 @@ class OrderSeeder:
 
         price_by_product = self._load_product_prices(company.company_id, products)
         self._generate_anomalies(company.name, days_list)
+        if self.anomalies:
+            _logger.info("%s Anomalies: %s", self._log_ctx(company), [a.kind for a in self.anomalies])
 
         for current_date in days_list:
             # Process pending actions (receipts/deliveries)
@@ -242,6 +251,7 @@ class OrderSeeder:
                 elif a.kind == "SUPPLIER_DELAY" and a.end_date and a.date <= current_date <= a.end_date:
                     delay_add = 15
                 elif a.kind == "SHRINKAGE" and a.date == current_date:
+                    _logger.debug("%s Shrinkage day: %s", self._log_ctx(company), current_date)
                     self._plan_shrinkage(company, warehouses, products, current_date)
 
             if not self.dry_run:
@@ -257,9 +267,12 @@ class OrderSeeder:
                         price_by_product,
                         delay_add=delay_add,
                     )
+                elif is_stockout:
+                    _logger.debug("%s Stockout window active: %s", self._log_ctx(company), current_date)
 
                 # 2. Sales
                 num_sales = self.rng.randint(0, int(daily_vol))
+                _logger.debug("%s Sales planned: %s on %s", self._log_ctx(company), num_sales, current_date)
                 for _ in range(num_sales):
                     self._plan_sale(company, warehouses, products, current_date, stats, sku_outbound_counts, price_by_product)
 
@@ -268,6 +281,15 @@ class OrderSeeder:
             due_date, _, action = heapq.heappop(self.pending_actions)
             if not self.dry_run:
                 action(max(due_date, end_date))
+
+        _logger.info(
+            "%s Completed orders: POs=%s (lines=%s), SOs=%s (lines=%s)",
+            self._log_ctx(company),
+            stats["po_count"],
+            stats["po_lines"],
+            stats["so_count"],
+            stats["so_lines"],
+        )
 
         return {
             "pickings_csv": "N/A (Orders Mode)",
@@ -328,7 +350,7 @@ class OrderSeeder:
             po_id = self.client.create("purchase.order", po_vals, allowed_company_ids=[company.company_id], company_id=company.company_id)
             self.client.call_kw("purchase.order", "button_confirm", args=[[po_id]], allowed_company_ids=[company.company_id], company_id=company.company_id)
         except Exception as exc:
-            _logger.warning("Purchase order creation/confirmation failed: %s", exc)
+            _logger.exception("%s Purchase order creation/confirmation failed: %s", self._log_ctx(company), exc)
             return
 
         stats["po_count"] += 1
@@ -338,10 +360,12 @@ class OrderSeeder:
         receipt_date = date + dt.timedelta(days=lead_time)
 
         def receive_action(act_date):
+            _logger.debug("%s Receiving PO pickings for %s", self._log_ctx(company), act_date)
             for picking_id in self._order_pickings("purchase.order", po_id, company.company_id):
-                self._validate_picking(company.company_id, picking_id, act_date)
+                self._validate_picking(company, picking_id, act_date)
 
         self._schedule_action(receipt_date, receive_action)
+        _logger.debug("%s Scheduled PO receipt for %s", self._log_ctx(company), receipt_date)
 
     def _plan_sale(
         self,
@@ -386,16 +410,19 @@ class OrderSeeder:
             so_id = self.client.create("sale.order", so_vals, allowed_company_ids=[company.company_id], company_id=company.company_id)
             self.client.call_kw("sale.order", "action_confirm", args=[[so_id]], allowed_company_ids=[company.company_id], company_id=company.company_id)
         except Exception as exc:
-            _logger.warning("Sales order creation/confirmation failed: %s", exc)
+            _logger.exception("%s Sales order creation/confirmation failed: %s", self._log_ctx(company), exc)
             return
 
         stats["so_count"] += 1
 
         def deliver_action(act_date):
+            _logger.debug("%s Delivering SO pickings for %s", self._log_ctx(company), act_date)
             for picking_id in self._order_pickings("sale.order", so_id, company.company_id):
-                self._validate_picking(company.company_id, picking_id, act_date)
+                self._validate_picking(company, picking_id, act_date)
 
-        self._schedule_action(date + dt.timedelta(days=self.rng.randint(0, 3)), deliver_action)
+        scheduled = date + dt.timedelta(days=self.rng.randint(0, 3))
+        self._schedule_action(scheduled, deliver_action)
+        _logger.debug("%s Scheduled SO delivery for %s", self._log_ctx(company), scheduled)
 
     def _plan_shrinkage(self, company: Company, warehouses: list[dict], products: list[Product], date: dt.date) -> None:
         if not products or not warehouses:
@@ -422,7 +449,7 @@ class OrderSeeder:
             # Attempt to backdate the scrap record and its move
             self.client.write("stock.scrap", [scrap_id], {"date_done": date.isoformat()}, allowed_company_ids=[company.company_id], company_id=company.company_id)
         except Exception as exc:
-            _logger.warning("Shrinkage (Scrap) failed: %s", exc)
+            _logger.exception("%s Shrinkage (Scrap) failed: %s", self._log_ctx(company), exc)
 
     def _order_pickings(self, model: str, order_id: int, company_id: int) -> list[int]:
         if self.dry_run:
@@ -488,7 +515,8 @@ class OrderSeeder:
                     company_id=company_id,
                 )
 
-    def _validate_picking(self, company_id: int, picking_id: int, date: dt.date) -> None:
+    def _validate_picking(self, company: Company, picking_id: int, date: dt.date) -> None:
+        company_id = company.company_id
         try:
             self.client.call_kw(
                 "stock.picking",
@@ -561,4 +589,4 @@ class OrderSeeder:
                 # Backdating is best-effort; not all configs allow it.
                 pass
         except Exception as exc:
-            _logger.warning("Picking validation failed %s: %s", picking_id, exc)
+            _logger.exception("%s Picking validation failed %s: %s", self._log_ctx(company), picking_id, exc)

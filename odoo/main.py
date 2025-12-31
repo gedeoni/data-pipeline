@@ -4,6 +4,7 @@ import argparse
 import datetime as dt
 import os
 import sys
+import logging
 from typing import Any
 from collections import defaultdict
 
@@ -36,6 +37,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--full-geo", action="store_true", help="Create more base-unit locations per warehouse")
     p.add_argument("--dry-run", action="store_true", help="Generate CSV + logs without calling Odoo")
     p.add_argument("--orders", action="store_true", help="Generate Purchase/Sales orders instead of direct stock moves")
+    p.add_argument("--no-master-data", action="store_true", help="Skip master data creation and reuse existing records")
     partition_group = p.add_mutually_exclusive_group()
     partition_group.add_argument("--orders-only", action="store_true", help="Only seed Purchase/Sales orders (no partitioning)")
     partition_group.add_argument("--movements-only", action="store_true", help="Only seed direct stock movements (no partitioning)")
@@ -119,6 +121,7 @@ def _run_orders_mode(
 
 
 def main(argv: list[str]) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     load_dotenv()
     args = parse_args(argv)
     countries = [c.strip().lower() for c in args.countries.split(",") if c.strip()]
@@ -141,6 +144,8 @@ def main(argv: list[str]) -> int:
     if not args.dry_run:
         client.authenticate()
         check_modules(client, require_orders=args.orders)
+    elif args.no_master_data:
+        raise SystemExit("--no-master-data requires live Odoo access (disable --dry-run).")
 
     master = MasterSeeder(client, dataset_key=dataset_key, dry_run=args.dry_run)
     mover = MovementSeeder(client, dataset_key=dataset_key, dry_run=args.dry_run, out_dir=args.out_dir)
@@ -154,8 +159,14 @@ def main(argv: list[str]) -> int:
     for country_code in countries:
         company_name = COUNTRY_COMPANY[country_code]
         geo = geo_plan(country_code, scale=args.scale, full_geo=args.full_geo)
-        company = master.seed_companies_warehouses_locations(company_name=company_name, country_code=country_code, geo=geo)
-        products, vendors_by_cat = master.seed_products_and_vendors(company=company)
+        if args.no_master_data:
+            company, products, vendors_by_cat = master.load_company_assets(
+                company_name=company_name,
+                country_code=country_code,
+            )
+        else:
+            company = master.seed_companies_warehouses_locations(company_name=company_name, country_code=country_code, geo=geo)
+            products, vendors_by_cat = master.seed_products_and_vendors(company=company)
 
         if args.movements_only:
             summary = mover.seed_movements(

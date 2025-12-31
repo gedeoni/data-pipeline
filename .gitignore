@@ -13,6 +13,7 @@ __pycache__/
 .venv/
 venv/
 .env/
+creds.md
 
 # Node
 node_modules/
