@@ -1,0 +1,47 @@
+services:
+  superset:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: superset
+    ports:
+      - "8088:8088"
+    env_file:
+      - .env
+    environment:
+      SUPERSET_ENV: production
+      SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - superset_home:/app/superset_home
+      - ./superset_config.py:/app/pythonpath/superset_config.py
+    command:
+      - /bin/bash
+      - -c
+      - |
+        superset db upgrade
+        superset fab create-admin --username admin --firstname Superset --lastname Admin --email admin@superset.com --password admin
+        superset init
+        superset run -h 0.0.0.0 -p 8088
+
+  db:
+    image: postgres:15
+    container_name: superset_db
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - superset_db:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    container_name: superset_redis
+
+volumes:
+  superset_db:
+  superset_home:

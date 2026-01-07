@@ -1,0 +1,196 @@
+x-airflow-common: &airflow-common
+  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:latest}
+  environment:
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://airflow-redis:6379/0
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@airflow-postgres/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.api_fastapi.auth.managers.simple.simple_auth_manager.SimpleAuthManager
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: admin:admin
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "false"
+    AIRFLOW__CORE__FERNET_KEY: "X0VJ9b7d8p9aU8dzzn1-7ISOfzcBndWhCwPwXBoUSLo="
+    _PIP_ADDITIONAL_REQUIREMENTS: "clickhouse-driver"
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/plugins:/opt/airflow/plugins
+    - ./airflow/simple_auth_manager_passwords.json.generated:/opt/airflow/simple_auth_manager_passwords.json.generated
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    airflow-postgres:
+      condition: service_healthy
+    airflow-redis:
+      condition: service_healthy
+
+services:
+  airflow-postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  airflow-redis:
+    image: redis:7
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8080:8080"
+    restart: always
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    restart: always
+    healthcheck:
+      test: ["CMD", "airflow", "jobs", "check", "--job-type", "SchedulerJob"]
+      interval: 30s
+      retries: 3
+      start_period: 30s
+
+  airflow-worker:
+    <<: *airflow-common
+    command: celery worker
+    restart: always
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    restart: always
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    restart: always
+
+  airflow-flower:
+    <<: *airflow-common
+    command: celery flower
+    ports:
+      - "5555:5555"
+    restart: always
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command: -c "airflow db migrate"
+    restart: "no"
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    restart: unless-stopped
+    environment: {}
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
+      - ./clickhouse/users.d:/etc/clickhouse-server/users.d
+      - ./clickhouse/users.xml:/etc/clickhouse-server/users.xml
+
+  superset:
+    build:
+      context: ./superset
+      dockerfile: Dockerfile
+    ports:
+      - "8088:8088"
+    env_file:
+      - ./superset/.env
+    environment:
+      SUPERSET_ENV: production
+      SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
+    depends_on:
+      - db
+      - redis
+      - superset-worker
+    volumes:
+      - superset_home:/app/superset_home
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py
+    command:
+      - /bin/bash
+      - -c
+      - |
+        superset db upgrade
+        superset fab create-admin --username admin --firstname Superset --lastname Admin --email admin@superset.com --password admin
+        superset init
+        superset run -h 0.0.0.0 -p 8088
+
+  db:
+    image: postgres:15
+    env_file:
+      - ./superset/.env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-superset}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-superset}
+      POSTGRES_DB: ${POSTGRES_DB:-superset}
+    volumes:
+      - superset_db:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+
+  superset-worker:
+    build:
+      context: ./superset
+      dockerfile: Dockerfile
+    env_file:
+      - ./superset/.env
+    environment:
+      SUPERSET_ENV: production
+      SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
+    volumes:
+      - superset_home:/app/superset_home
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py
+    command:
+      - /bin/bash
+      - -c
+      - |
+        superset db upgrade
+        superset init
+        celery --app=superset.tasks.celery_app:app worker --loglevel=INFO --concurrency=2
+    depends_on:
+      - db
+      - redis
+
+  odoo:
+    image: odoo:17
+    ports:
+      - "8069:8069"
+    environment:
+      HOST: host.docker.internal
+      PORT: 5432
+      USER: odoo
+      PASSWORD: odoo
+      # DATABASE: odoo
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - odoo_data:/var/lib/odoo
+      - ./odoo/addons:/mnt/extra-addons
+
+volumes:
+  postgres-db-volume:
+  clickhouse_data:
+  clickhouse_logs:
+  superset_db:
+  superset_home:
+  odoo_data:
