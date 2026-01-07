@@ -74,6 +74,9 @@ class DamageSeeder:
     ) -> None:
         wh = wh_ctx.warehouse
         active_products = wh_ctx.profile.active_products
+        active_products = self.seeder._eligible_products(ctx, active_products, day)
+        if not active_products:
+            return
         good_loc = self.seeder._pick_base_unit_location(ctx, wh.code, "GOOD")
         dmg_loc = self.seeder._pick_base_unit_location(ctx, wh.code, "DAMAGED")
 

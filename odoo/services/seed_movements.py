@@ -74,6 +74,10 @@ class SimulationContext:
     outbound_qty_by_sku: Counter = field(default_factory=Counter)
     seq_counter: dict[tuple[str, str, dt.date], int] = field(default_factory=lambda: defaultdict(int))
 
+    # Dormant SKUs to guarantee liquidation candidates.
+    dormant_products: set[int] = field(default_factory=set)
+    dormant_start: dt.date | None = None
+
 
 class MovementSeeder:
     def __init__(
@@ -529,6 +533,20 @@ class MovementSeeder:
         ctx.rng.shuffle(good_locs)
         return [lid for lid in good_locs if self.ledger.get(int(lid), product_id) > 0.01]
 
+    def _eligible_products(
+        self,
+        ctx: SimulationContext,
+        active_products: list[Product],
+        day: dt.date,
+    ) -> list[Product]:
+        """Exclude dormant SKUs after a cutoff to create liquidation candidates."""
+        if not ctx.dormant_start or day < ctx.dormant_start:
+            return active_products
+        return [
+            p for p in active_products
+            if int(p.product_id) not in ctx.dormant_products
+        ]
+
     def _create_and_validate_picking(
         self,
         ctx: SimulationContext,
@@ -684,6 +702,12 @@ class MovementSeeder:
             wh_meta=warehouse_meta,
             vendor_ids_by_category=vendor_ids_by_category,
         )
+
+        if products and days_list:
+            dormant_n = max(1, int(len(products) * 0.08))
+            dormant_sample = rng.sample(products, k=min(dormant_n, len(products)))
+            ctx.dormant_products = {int(p.product_id) for p in dormant_sample if p.product_id}
+            ctx.dormant_start = days_list[int(len(days_list) * 0.6)]
 
         # Anomalies: adding demand spikes , controlled stockouts, and shrinkage windows info to the context.
         self._generate_demand_spikes(ctx)

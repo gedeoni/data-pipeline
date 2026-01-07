@@ -77,7 +77,10 @@ class InboundSeeder:
         had_stockout_reduction = False
         lines: list[tuple[Any, float]] = []
 
-        for prod in ctx.rng.sample(active_products, k=sample_size):
+        candidates = self.seeder._eligible_products(ctx, active_products, day)
+        if not candidates:
+            return [], False
+        for prod in ctx.rng.sample(candidates, k=min(sample_size, len(candidates))):
             low, high = category_qty_ranges.get(
                 prod.category, category_qty_ranges["__default__"]
             )

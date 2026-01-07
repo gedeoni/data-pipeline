@@ -1,0 +1,22 @@
+{
+  "abc_a_pct": "0.80",
+  "abc_b_pct": "0.15",
+  "abc_c_pct": "0.05",
+  "anomaly_pct": "0.2",
+  "dead_stock_days": "30",
+  "excluded_company_ids": "[1, 2]",
+  "forecast_top_n_or_only_class_a": "only_class_a",
+  "full_refresh_models": "[\"product.template\", \"product.product\"]",
+  "odoo_helpdesk_team_id": "1",
+  "odoo_watermark__product.product": "1970-01-01 00:00:00",
+  "odoo_watermark__product.template": "1970-01-01 00:00:00",
+  "odoo_watermark__purchase.order": "1970-01-01 00:00:00",
+  "odoo_watermark__res.partner": "1970-01-01 00:00:00",
+  "odoo_watermark__stock.location": "1970-01-01 00:00:00",
+  "odoo_watermark__stock.move": "1970-01-01 00:00:00",
+  "odoo_watermark__stock.move.line": "1970-01-01 00:00:00",
+  "odoo_watermark__stock.quant": "1970-01-01 00:00:00",
+  "odoo_watermark__stock.valuation.layer": "1970-01-01 00:00:00",
+  "otif_threshold": "0.8",
+  "procurement_manager_email": "procurement@example.com"
+}

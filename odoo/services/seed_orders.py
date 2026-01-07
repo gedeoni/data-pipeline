@@ -38,6 +38,8 @@ class OrderSeeder:
         self._pending_seq = 0
         self.anomalies: list[AnomalyEvent] = []
         self._move_line_done_field: str | None = None
+        self.ledger: dict[tuple[int, int], float] = defaultdict(float)
+        self._stock_move_fields: set[str] | None = None
 
     def _get_or_create_customer(self) -> int:
         if self.customers:
@@ -83,6 +85,62 @@ class OrderSeeder:
         else:
             raise RuntimeError("Unsupported Odoo stock.move.line done qty field.")
         return self._move_line_done_field
+
+    def _stock_move_has_field(self, field_name: str) -> bool:
+        if self._stock_move_fields is None:
+            if self.dry_run:
+                self._stock_move_fields = set()
+            else:
+                fields = self.client.call_kw(
+                    "stock.move",
+                    "fields_get",
+                    args=[[]],
+                    kwargs={"attributes": ["type"]},
+                )
+                self._stock_move_fields = set(fields.keys())
+        return field_name in self._stock_move_fields
+
+    def _prime_stock_ledger(self, company_id: int, warehouses: list[dict], products: list[Product]) -> None:
+        """Load current on-hand quantities into a simple ledger keyed by (location_id, product_id)."""
+        if self.dry_run:
+            return
+        self.ledger.clear()
+        loc_ids = [int(wh["lot_stock_id"][0]) for wh in warehouses if wh.get("lot_stock_id")]
+        product_ids = [int(p.product_id) for p in products if p.product_id]
+        if not loc_ids or not product_ids:
+            return
+        quants = self.client.search_read(
+            "stock.quant",
+            [["location_id", "in", loc_ids], ["product_id", "in", product_ids]],
+            fields=["location_id", "product_id", "quantity"],
+            allowed_company_ids=[company_id],
+            company_id=company_id,
+        )
+        for q in quants:
+            loc = int(q["location_id"][0])
+            pid = int(q["product_id"][0])
+            self.ledger[(loc, pid)] += float(q.get("quantity") or 0.0)
+
+    def _apply_picking_to_ledger(self, company_id: int, picking_id: int) -> None:
+        if self.dry_run:
+            return
+        done_field = self._get_move_line_done_field()
+        lines = self.client.search_read(
+            "stock.move.line",
+            [["picking_id", "=", picking_id]],
+            fields=["product_id", done_field, "location_id", "location_dest_id"],
+            allowed_company_ids=[company_id],
+            company_id=company_id,
+        )
+        for line in lines:
+            pid = int(line["product_id"][0])
+            qty = float(line.get(done_field) or 0.0)
+            if qty <= 0:
+                continue
+            src = int(line["location_id"][0])
+            dst = int(line["location_dest_id"][0])
+            self.ledger[(src, pid)] -= qty
+            self.ledger[(dst, pid)] += qty
 
     def _process_pending_actions(self, current_date: dt.date) -> None:
         while self.pending_actions and self.pending_actions[0][0] <= current_date:
@@ -139,23 +197,29 @@ class OrderSeeder:
     def _load_product_prices(self, company_id: int, products: list[Product]) -> dict[int, dict[str, float]]:
         if self.dry_run:
             return {}
-        product_ids = [p.product_id for p in products if p.product_id]
-        if not product_ids:
+        tmpl_ids = [p.product_tmpl_id for p in products if p.product_tmpl_id]
+        if not tmpl_ids:
             return {}
-        records = self.client.read(
-            "product.product",
-            product_ids,
+        tmpl_records = self.client.read(
+            "product.template",
+            list({int(tid) for tid in tmpl_ids}),
             fields=["id", "list_price", "standard_price"],
             allowed_company_ids=[company_id],
             company_id=company_id,
         )
-        price_by_product: dict[int, dict[str, float]] = {}
-        for r in records:
-            pid = int(r["id"])
-            price_by_product[pid] = {
-                "list_price": float(r.get("list_price") or 0.0),
-                "standard_price": float(r.get("standard_price") or 0.0),
+        price_by_tmpl: dict[int, dict[str, float]] = {}
+        for rec in tmpl_records:
+            tid = int(rec["id"])
+            price_by_tmpl[tid] = {
+                "list_price": float(rec.get("list_price") or 0.0),
+                "standard_price": float(rec.get("standard_price") or 0.0),
             }
+        price_by_product: dict[int, dict[str, float]] = {}
+        for p in products:
+            if not p.product_id or not p.product_tmpl_id:
+                continue
+            prices = price_by_tmpl.get(int(p.product_tmpl_id), {"list_price": 0.0, "standard_price": 0.0})
+            price_by_product[int(p.product_id)] = dict(prices)
         return price_by_product
 
     def _price_for_product(self, price_by_product: dict[int, dict[str, float]], product: Product, *, kind: str) -> float:
@@ -232,6 +296,8 @@ class OrderSeeder:
             ]
 
         price_by_product = self._load_product_prices(company.company_id, products)
+        if not self.dry_run:
+            self._prime_stock_ledger(company.company_id, warehouses, products)
         self._generate_anomalies(company.name, days_list)
         if self.anomalies:
             _logger.info("%s Anomalies: %s", self._log_ctx(company), [a.kind for a in self.anomalies])
@@ -320,6 +386,14 @@ class OrderSeeder:
 
         wh = self.rng.choice(warehouses)
 
+        # Lead time determines planned dates; actual receipt can be early/on-time/late.
+        lead_time = self.rng.randint(1, 7) + delay_add
+        planned_date = date + dt.timedelta(days=lead_time)
+        receipt_delay = self.rng.randint(-2, 5)
+        receipt_date = planned_date + dt.timedelta(days=receipt_delay)
+        if receipt_date < date:
+            receipt_date = date
+
         po_vals = {
             "partner_id": vendor_id,
             "company_id": company.company_id,
@@ -338,7 +412,7 @@ class OrderSeeder:
                 "product_id": p.product_id,
                 "product_qty": qty,
                 "price_unit": price,
-                "date_planned": date.isoformat(),
+                "date_planned": planned_date.isoformat(),
             }))
             stats["po_lines"] += 1
 
@@ -354,10 +428,6 @@ class OrderSeeder:
             return
 
         stats["po_count"] += 1
-
-        # Schedule Receipt with random lead time
-        lead_time = self.rng.randint(1, 7) + delay_add
-        receipt_date = date + dt.timedelta(days=lead_time)
 
         def receive_action(act_date):
             _logger.debug("%s Receiving PO pickings for %s", self._log_ctx(company), act_date)
@@ -381,6 +451,10 @@ class OrderSeeder:
             return
         customer_id = self._get_or_create_customer()
         wh = self.rng.choice(warehouses)
+        stock_loc_id = wh.get("lot_stock_id")
+        if not stock_loc_id:
+            return
+        stock_loc_id = int(stock_loc_id[0])
 
         so_vals = {
             "partner_id": customer_id,
@@ -394,7 +468,12 @@ class OrderSeeder:
         if not subset:
             return
         for p in subset:
-            qty = self.rng.randint(1, 10)
+            avail = float(self.ledger.get((stock_loc_id, int(p.product_id)), 0.0))
+            if avail <= 0.01:
+                continue
+            qty = min(float(self.rng.randint(1, 10)), avail)
+            if qty <= 0.01:
+                continue
             so_vals["order_line"].append((0, 0, {
                 "product_id": p.product_id,
                 "product_uom_qty": qty,
@@ -406,6 +485,8 @@ class OrderSeeder:
         # Set warehouse for the sales order
         so_vals["warehouse_id"] = wh["id"]
 
+        if not so_vals["order_line"]:
+            return
         try:
             so_id = self.client.create("sale.order", so_vals, allowed_company_ids=[company.company_id], company_id=company.company_id)
             self.client.call_kw("sale.order", "action_confirm", args=[[so_id]], allowed_company_ids=[company.company_id], company_id=company.company_id)
@@ -434,7 +515,12 @@ class OrderSeeder:
             return
 
         p = self.rng.choice(products)
-        qty = self.rng.randint(5, 20)
+        avail = float(self.ledger.get((int(stock_loc_id[0]), int(p.product_id)), 0.0))
+        if avail <= 0.01:
+            return
+        qty = min(float(self.rng.randint(5, 20)), avail)
+        if qty <= 0.01:
+            return
 
         scrap_vals = {
             "product_id": p.product_id,
@@ -448,6 +534,7 @@ class OrderSeeder:
             self.client.call_kw("stock.scrap", "action_validate", args=[[scrap_id]], allowed_company_ids=[company.company_id], company_id=company.company_id)
             # Attempt to backdate the scrap record and its move
             self.client.write("stock.scrap", [scrap_id], {"date_done": date.isoformat()}, allowed_company_ids=[company.company_id], company_id=company.company_id)
+            self.ledger[(int(stock_loc_id[0]), int(p.product_id))] -= qty
         except Exception as exc:
             _logger.exception("%s Shrinkage (Scrap) failed: %s", self._log_ctx(company), exc)
 
@@ -466,7 +553,7 @@ class OrderSeeder:
         picking_ids = records[0].get("picking_ids") or []
         return [int(pid) for pid in picking_ids]
 
-    def _ensure_move_lines_done(self, company_id: int, picking_id: int) -> None:
+    def _ensure_move_lines_done(self, company_id: int, picking_id: int, *, limit_outgoing: bool = False) -> None:
         if self.dry_run:
             return
         done_field = self._get_move_line_done_field()
@@ -481,6 +568,13 @@ class OrderSeeder:
             qty_done = float(mv.get("product_uom_qty") or 0.0)
             if qty_done <= 0:
                 continue
+            if limit_outgoing:
+                src = int(mv["location_id"][0])
+                pid = int(mv["product_id"][0])
+                avail = float(self.ledger.get((src, pid), 0.0))
+                qty_done = min(qty_done, avail)
+                if qty_done <= 0:
+                    continue
             move_id = int(mv["id"])
             existing = self.client.search_read(
                 "stock.move.line",
@@ -518,6 +612,23 @@ class OrderSeeder:
     def _validate_picking(self, company: Company, picking_id: int, date: dt.date) -> None:
         company_id = company.company_id
         try:
+            picking = self.client.read(
+                "stock.picking",
+                [picking_id],
+                fields=["picking_type_id"],
+                allowed_company_ids=[company_id],
+                company_id=company_id,
+            )
+            picking_type_id = int(picking[0]["picking_type_id"][0]) if picking else 0
+            picking_type = self.client.read(
+                "stock.picking.type",
+                [picking_type_id],
+                fields=["code"],
+                allowed_company_ids=[company_id],
+                company_id=company_id,
+            )
+            is_outgoing = bool(picking_type and picking_type[0].get("code") == "outgoing")
+
             self.client.call_kw(
                 "stock.picking",
                 "action_confirm",
@@ -532,7 +643,38 @@ class OrderSeeder:
                 allowed_company_ids=[company_id],
                 company_id=company_id,
             )
-            self._ensure_move_lines_done(company_id, picking_id)
+            moves_state = self.client.search_read(
+                "stock.move",
+                [["picking_id", "=", picking_id]],
+                fields=["state"],
+                allowed_company_ids=[company_id],
+                company_id=company_id,
+            )
+            if not any(m.get("state") == "assigned" for m in moves_state):
+                _logger.warning(
+                    "%s Skipping picking %s: moves not assigned",
+                    self._log_ctx(company),
+                    picking_id,
+                )
+                return
+            # Skip validation when nothing was reserved to avoid Odoo hard error.
+            if self._stock_move_has_field("reserved_availability"):
+                reserved = self.client.search_read(
+                    "stock.move",
+                    [["picking_id", "=", picking_id]],
+                    fields=["reserved_availability"],
+                    allowed_company_ids=[company_id],
+                    company_id=company_id,
+                )
+                total_reserved = sum(float(m.get("reserved_availability") or 0.0) for m in reserved)
+                if total_reserved <= 0.0:
+                    _logger.warning(
+                        "%s Skipping picking %s: no reserved quantities",
+                        self._log_ctx(company),
+                        picking_id,
+                    )
+                    return
+            self._ensure_move_lines_done(company_id, picking_id, limit_outgoing=is_outgoing)
             res = self.client.call_kw(
                 "stock.picking",
                 "button_validate",
@@ -588,5 +730,6 @@ class OrderSeeder:
             except Exception:
                 # Backdating is best-effort; not all configs allow it.
                 pass
+            self._apply_picking_to_ledger(company_id, picking_id)
         except Exception as exc:
             _logger.exception("%s Picking validation failed %s: %s", self._log_ctx(company), picking_id, exc)

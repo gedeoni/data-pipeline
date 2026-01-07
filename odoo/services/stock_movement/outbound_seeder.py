@@ -57,7 +57,10 @@ class OutboundSeeder:
         lines: list[tuple[Any, float]] = []
         note = ""
 
-        for prod in ctx.rng.sample(active_products, k=min(line_n, len(active_products))):
+        candidates = self.seeder._eligible_products(ctx, active_products, day)
+        if not candidates:
+            return [], note
+        for prod in ctx.rng.sample(candidates, k=min(line_n, len(candidates))):
             intensity = demand_intensity(ctx.company.country_code, prod.category, day, rng=ctx.rng) * spike_mult
             qty = base_rates[prod.category] * intensity * weight
 

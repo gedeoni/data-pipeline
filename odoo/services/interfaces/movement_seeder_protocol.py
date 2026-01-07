@@ -14,6 +14,8 @@ class MovementSeederProtocol(Protocol):
 
     def _available_locations_for_product(self, ctx, wh_code: str, product_id: int) -> list[int]: ...
 
+    def _eligible_products(self, ctx, active_products: list[Any], day: dt.date) -> list[Any]: ...
+
     def _create_and_validate_picking(
         self,
         ctx,

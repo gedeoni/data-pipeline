@@ -74,13 +74,17 @@ class InternalSeeder:
         ctx,
         wh_ctx: InternalWarehouseContext,
         *,
+        day: dt.date,
         qty_range_default: tuple[float, float],
         qty_range_small: tuple[float, float],
         availability_cap: float,
     ) -> InternalTransferDetails | None:
         wh = wh_ctx.warehouse
         active_products = wh_ctx.profile.active_products
-        prod = ctx.rng.choice(active_products)
+        candidates = self.seeder._eligible_products(ctx, active_products, day)
+        if not candidates:
+            return None
+        prod = ctx.rng.choice(candidates)
 
         src_candidates = self.seeder._available_locations_for_product(ctx, wh.code, int(prod.product_id))
         if not src_candidates:
@@ -136,6 +140,7 @@ class InternalSeeder:
         details = self._generate_internal_transfer_details(
             ctx,
             wh_ctx,
+            day=day,
             qty_range_default=qty_range_default,
             qty_range_small=qty_range_small,
             availability_cap=availability_cap,

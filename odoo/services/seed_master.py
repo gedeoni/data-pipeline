@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import logging
+import random
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from entities import Company, Product, Warehouse
@@ -11,6 +13,8 @@ from services.master_data.company_seeder import CompanySeeder
 from services.master_data.partner_seeder import PartnerSeeder
 from services.master_data.product_seeder import ProductSeeder
 from services.master_data.warehouse_seeder import WarehouseSeeder
+
+_logger = logging.getLogger(__name__)
 
 
 def _stable_int_seed(value: str) -> int:
@@ -113,6 +117,188 @@ class MasterSeeder:
         return self.product_seeder.seed_products_and_vendors(
             company=company, min_products=min_products, max_products=max_products
         )
+
+    def apply_cost_drifts(
+        self,
+        *,
+        company_id: int,
+        products: list[Product],
+        rng: random.Random,
+    ) -> None:
+        """Introduce controlled cost drift so anomaly marts have signal."""
+        if self.dry_run or not products:
+            return
+        sample_n = max(1, int(len(products) * 0.1))
+        sample = rng.sample(products, k=min(sample_n, len(products)))
+        tmpl_ids = [p.product_tmpl_id for p in sample if p.product_tmpl_id]
+        if not tmpl_ids:
+            return
+        records = self.client.read(
+            "product.template",
+            tmpl_ids,
+            fields=["id", "standard_price", "list_price"],
+            allowed_company_ids=[company_id],
+            company_id=company_id,
+        )
+        for rec in records:
+            base = float(rec.get("standard_price") or 0.0)
+            if base <= 0:
+                base = float(rec.get("list_price") or 10.0) * 0.6
+            factor = rng.uniform(0.5, 1.8)
+            new_cost = max(0.01, base * factor)
+            vals: dict[str, Any] = {"standard_price": new_cost}
+            if rec.get("list_price"):
+                vals["list_price"] = max(0.01, float(rec["list_price"]) * rng.uniform(0.8, 1.2))
+            self.client.write(
+                "product.template",
+                [int(rec["id"])],
+                vals,
+                allowed_company_ids=[company_id],
+                company_id=company_id,
+            )
+
+    def ensure_product_prices(
+        self,
+        *,
+        company_id: int,
+        products: list[Product],
+        rng: random.Random,
+    ) -> None:
+        """Ensure products have a usable standard/list price for analytics."""
+        if self.dry_run:
+            return
+        tmpl_ids = {int(p.product_tmpl_id) for p in products if p.product_tmpl_id}
+        # Ensure pricing for every template in the company, not only those in the seed list.
+        all_ids = self.client.search(
+            "product.template",
+            [],
+            allowed_company_ids=[company_id],
+            company_id=company_id,
+        )
+        tmpl_ids.update(all_ids)
+        if not tmpl_ids:
+            return
+        chunk = []
+        for tmpl_id in tmpl_ids:
+            chunk.append(tmpl_id)
+            if len(chunk) < 200:
+                continue
+            self._set_prices_for_templates(company_id=company_id, tmpl_ids=chunk, rng=rng)
+            chunk = []
+        if chunk:
+            self._set_prices_for_templates(company_id=company_id, tmpl_ids=chunk, rng=rng)
+
+    def _set_prices_for_templates(
+        self,
+        *,
+        company_id: int,
+        tmpl_ids: list[int],
+        rng: random.Random,
+    ) -> None:
+        records = self.client.read(
+            "product.template",
+            list({int(tid) for tid in tmpl_ids}),
+            fields=["id", "standard_price", "list_price"],
+            allowed_company_ids=[company_id],
+            company_id=company_id,
+        )
+        for rec in records:
+            standard_price = float(rec.get("standard_price") or 0.0)
+            list_price = float(rec.get("list_price") or 0.0)
+            if standard_price > 0 and list_price > 0:
+                continue
+            if list_price <= 0:
+                list_price = rng.uniform(12.0, 120.0)
+            if standard_price <= 0:
+                standard_price = max(0.01, list_price * rng.uniform(0.5, 0.85))
+            self.client.write(
+                "product.template",
+                [int(rec["id"])],
+                {"standard_price": standard_price, "list_price": list_price},
+                allowed_company_ids=[company_id],
+                company_id=company_id,
+            )
+
+    def ensure_initial_stock(
+        self,
+        *,
+        company: Company,
+        products: list[Product],
+        rng: random.Random,
+        min_qty: float = 40.0,
+        max_qty: float = 200.0,
+    ) -> None:
+        """Seed on-hand quantities in GOOD locations so reservations can succeed."""
+        if self.dry_run or not products:
+            return
+        stock_locations = [int(w.stock_location_id) for w in company.warehouses if w.stock_location_id]
+        if not stock_locations:
+            _logger.warning("No warehouse stock locations found; skipping initial stock seeding.")
+            return
+
+        fields = self.client.call_kw(
+            "stock.quant",
+            "fields_get",
+            args=[[]],
+            kwargs={"attributes": ["type"]},
+        )
+        if "inventory_quantity" in fields:
+            inv_field = "inventory_quantity"
+        elif "inventory_quantity_set" in fields:
+            inv_field = "inventory_quantity_set"
+        else:
+            _logger.warning("stock.quant inventory field not found; skipping initial stock seeding.")
+            return
+
+        for loc_id in stock_locations:
+            for prod in products:
+                if not prod.product_id:
+                    continue
+                qty = float(rng.uniform(min_qty, max_qty))
+                existing = self.client.search_read(
+                    "stock.quant",
+                    [["location_id", "=", loc_id], ["product_id", "=", int(prod.product_id)]],
+                    fields=["id"],
+                    limit=1,
+                    allowed_company_ids=[company.company_id],
+                    company_id=company.company_id,
+                )
+                if existing:
+                    quant_id = int(existing[0]["id"])
+                    self.client.write(
+                        "stock.quant",
+                        [quant_id],
+                        {inv_field: qty},
+                        allowed_company_ids=[company.company_id],
+                        company_id=company.company_id,
+                    )
+                else:
+                    quant_id = self.client.create(
+                        "stock.quant",
+                        {
+                            "product_id": int(prod.product_id),
+                            "location_id": loc_id,
+                            "company_id": company.company_id,
+                            inv_field: qty,
+                        },
+                        allowed_company_ids=[company.company_id],
+                        company_id=company.company_id,
+                    )
+                try:
+                    self.client.call_kw(
+                        "stock.quant",
+                        "action_apply_inventory",
+                        args=[[quant_id]],
+                        allowed_company_ids=[company.company_id],
+                        company_id=company.company_id,
+                    )
+                except Exception as exc:
+                    _logger.warning(
+                        "Failed to apply inventory for product %s at location %s: %s",
+                        prod.product_id,
+                        loc_id,
+                        exc,
+                    )
 
     def load_company_assets(
         self,

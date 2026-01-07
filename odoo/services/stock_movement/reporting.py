@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import datetime as dt
 from collections import defaultdict
+from dataclasses import asdict, is_dataclass
 from typing import Any
 
 from services.interfaces.movement_seeder_protocol import MovementSeederProtocol
@@ -14,27 +15,37 @@ class Reporting:
     def __init__(self, seeder: MovementSeederProtocol):
         self.seeder = seeder
 
+    def _row_to_dict(self, row: Any) -> dict[str, Any]:
+        if isinstance(row, dict):
+            return row
+        if is_dataclass(row):
+            return asdict(row)
+        return dict(row)
+
     def _write_pickings_csv(self, ctx, path: str) -> None:
         with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(ctx.picking_rows[0].keys()) if ctx.picking_rows else ["origin"])
+            first = self._row_to_dict(ctx.picking_rows[0]) if ctx.picking_rows else {"origin": ""}
+            writer = csv.DictWriter(f, fieldnames=list(first.keys()))
             writer.writeheader()
             for row in ctx.picking_rows:
-                writer.writerow(row)
+                writer.writerow(self._row_to_dict(row))
 
     def _write_moves_csv(self, ctx, path: str) -> None:
         with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(ctx.move_rows[0].keys()) if ctx.move_rows else ["origin"])
+            first = self._row_to_dict(ctx.move_rows[0]) if ctx.move_rows else {"origin": ""}
+            writer = csv.DictWriter(f, fieldnames=list(first.keys()))
             writer.writeheader()
             for row in ctx.move_rows:
-                writer.writerow(row)
+                writer.writerow(self._row_to_dict(row))
 
     def _daily_outbound(self, ctx) -> defaultdict[tuple[str, str], float]:
         daily_outbound: defaultdict[tuple[str, str], float] = defaultdict(float)
         for r in ctx.move_rows:
-            if r.get("kind") != "OUT":
+            row = self._row_to_dict(r)
+            if row.get("kind") != "OUT":
                 continue
-            day = str(r["scheduled_date"])[:10]
-            daily_outbound[(day, str(r["product"]))] += float(r["qty_done"])
+            day = str(row["scheduled_date"])[:10]
+            daily_outbound[(day, str(row["product"]))] += float(row["qty_done"])
         return daily_outbound
 
     def _avg_outbound_last_n(

@@ -5,6 +5,7 @@ import datetime as dt
 import os
 import sys
 import logging
+import random
 from typing import Any
 from collections import defaultdict
 
@@ -22,6 +23,12 @@ COUNTRY_COMPANY = {
     "ug": "Uganda",
     "ke": "Kenya",
 }
+
+
+def _stable_int_seed(value: str) -> int:
+    import hashlib
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return int(digest[:16], 16)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -168,6 +175,15 @@ def main(argv: list[str]) -> int:
             company = master.seed_companies_warehouses_locations(company_name=company_name, country_code=country_code, geo=geo)
             products, vendors_by_cat = master.seed_products_and_vendors(company=company)
 
+        price_rng = random.Random(_stable_int_seed(f"{dataset_key}:{company_name}:prices"))
+        master.ensure_product_prices(company_id=company.company_id, products=products, rng=price_rng)
+
+        stock_rng = random.Random(_stable_int_seed(f"{dataset_key}:{company_name}:stock"))
+        master.ensure_initial_stock(company=company, products=products, rng=stock_rng)
+
+        drift_rng = random.Random(_stable_int_seed(f"{dataset_key}:{company_name}:cost_drift"))
+        master.apply_cost_drifts(company_id=company.company_id, products=products, rng=drift_rng)
+
         if args.movements_only:
             summary = mover.seed_movements(
                 company=company,
@@ -184,17 +200,10 @@ def main(argv: list[str]) -> int:
                 days=args.days,
                 scale=args.scale,
             )
-        elif args.orders:
+        else:
+            # Default to orders mode to ensure PO-based analytics have signal.
             summary = _run_orders_mode(
                 args, company, products, vendors_by_cat, end_date, order_seeder, mover
-            )
-        else:
-            summary = mover.seed_movements(
-                company=company,
-                products=products,
-                vendor_ids_by_category=vendors_by_cat,
-                days=args.days,
-                scale=args.scale,
             )
         summaries.append((company_name, summary))
 
