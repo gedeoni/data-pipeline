@@ -6,6 +6,8 @@ import os
 import sys
 import logging
 import random
+import time
+import json
 from typing import Any
 from collections import defaultdict
 
@@ -65,7 +67,15 @@ def check_modules(client: OdooClient, require_orders: bool = False) -> None:
     by_name = {m["name"]: m["state"] for m in mods}
     missing = [n for n in required if by_name.get(n) not in ("installed", "to upgrade")]
     if missing:
-        raise SystemExit(f"Missing required Odoo modules: {missing}. Install Inventory (stock) in the UI first.")
+        print(f"Missing required Odoo modules: {missing}. Attempting to install them automatically...")
+        try:
+            mod_ids = client.search("ir.module.module", [["name", "in", missing]])
+            if not mod_ids:
+                raise SystemExit(f"Could not find modules {missing} in Odoo's module list.")
+            client.call_kw("ir.module.module", "button_immediate_install", [mod_ids])
+            print("Successfully installed missing modules!")
+        except Exception as e:
+            raise SystemExit(f"Failed to auto-install missing Odoo modules {missing}: {e}. Please install them manually in the UI.")
 
 
 def _run_orders_mode(
@@ -128,6 +138,7 @@ def _run_orders_mode(
 
 
 def main(argv: list[str]) -> int:
+    global_start_time = time.perf_counter()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     load_dotenv()
     args = parse_args(argv)
@@ -163,8 +174,10 @@ def main(argv: list[str]) -> int:
     print(f"Output dir: {args.out_dir}")
 
     summaries: list[tuple[str, dict]] = []
+    company_durations: dict[str, float] = {}
     for country_code in countries:
         company_name = COUNTRY_COMPANY[country_code]
+        company_start_time = time.perf_counter()
         geo = geo_plan(country_code, scale=args.scale, full_geo=args.full_geo)
         if args.no_master_data:
             company, products, vendors_by_cat = master.load_company_assets(
@@ -206,6 +219,7 @@ def main(argv: list[str]) -> int:
                 args, company, products, vendors_by_cat, end_date, order_seeder, mover
             )
         summaries.append((company_name, summary))
+        company_durations[company_name] = time.perf_counter() - company_start_time
 
     print("\nSummary")
     for company_name, s in summaries:
@@ -227,6 +241,30 @@ def main(argv: list[str]) -> int:
     print("\nOdoo modules")
     print("- Required: Inventory (stock)")
     print("- Optional: Purchase (purchase), Sales (sale)\n")
+
+    total_elapsed = time.perf_counter() - global_start_time
+    print("Performance Metrics")
+    print(f"- Total Seeding Time: {total_elapsed:.2f} seconds")
+    for company_name, duration in company_durations.items():
+        print(f"  - {company_name}: {duration:.2f} seconds")
+
+    try:
+        os.makedirs(args.out_dir, exist_ok=True)
+        perf_log_path = os.path.join(args.out_dir, f"perf_log_{dataset_key}.json")
+        perf_data = {
+            "dataset_key": dataset_key,
+            "dry_run": args.dry_run,
+            "scale": args.scale,
+            "days": args.days,
+            "total_duration_seconds": total_elapsed,
+            "company_durations_seconds": company_durations,
+            "timestamp": dt.datetime.now().isoformat()
+        }
+        with open(perf_log_path, "w") as f:
+            json.dump(perf_data, f, indent=2)
+        print(f"Performance data logged to: {perf_log_path}\n")
+    except Exception as e:
+        print(f"Warning: Could not write performance log file: {e}\n")
 
     return 0
 

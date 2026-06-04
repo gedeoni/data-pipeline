@@ -25,15 +25,18 @@ By default, the script uses **stock pickings** directly. If using `--orders`, fu
 ### Python
 
 - Python 3.10+ recommended
-Create virtual env
+
+**Using `uv` (Recommended)**:
+Simply run the following command to create the virtual environment and install all dependencies:
+```bash
+uv sync
+```
+
+**Using standard `pip`**:
+Create virtual env and install:
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-```
-
-Install dependencies:
-
-```bash
 pip install -r requirements.txt
 ```
 
@@ -107,6 +110,12 @@ Ensure Odoo 17 is running locally and you can log in to the database.
 
 ### 2) Install Python deps
 
+**Using `uv`**:
+```bash
+uv sync
+```
+
+**Using `pip`**:
 ```bash
 pip install -r requirements.txt
 ```

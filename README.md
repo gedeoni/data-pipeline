@@ -62,19 +62,25 @@ graph LR
 docker compose up --build
 ```
 
-2) Setup Odoo
-- **Install modules**: Sales, Purchase, Inventory.
-- **Create companies**: Kenya, Uganda, Rwanda.
+2) Setup Odoo and seed data
+- **Automated setup**: The seeder script automatically handles installing required modules (Inventory, Sales, Purchase, etc.) and creating/configuring the companies (Kenya, Uganda, Rwanda).
 - **Run the seeder**:
-  Navigate to the `odoo` directory, create a virtual environment, and run the script:
+  Navigate to the `odoo` directory and run the seeder:
 
+  **Using `uv` (Recommended)**:
+  ```bash
+  cd odoo
+  uv run main.py --orders --scale medium --days 60 --countries rw,ug,ke
+  ```
+
+  **Using standard `pip`**:
   ```bash
   cd odoo
   python3 -m venv venv
   source venv/bin/activate  # Windows: venv\Scripts\activate
   pip install -r requirements.txt
 
-  # Run seeder (refer to odoo/README.md for more options)
+  # Run seeder
   python main.py --orders --scale medium --days 60 --countries rw,ug,ke
   ```
   

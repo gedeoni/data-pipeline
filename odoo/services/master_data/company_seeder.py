@@ -48,6 +48,11 @@ class CompanySeeder:
             return cid
         country_id = self.ensure_country_id(country_code)
         cid = self.master.client.create("res.company", {"name": name, "country_id": country_id})
+        try:
+            self.master.client.write("res.users", [self.master.client.uid], {"company_ids": [(4, cid)]})
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("Could not automatically assign company %s to active user: %s", name, e)
         self.master.store.set("res.company", key, cid)
         return cid
 
