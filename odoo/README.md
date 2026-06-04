@@ -11,8 +11,8 @@ This dataset is designed for downstream ETL (e.g., Airflow) to compute stockout 
 - Odoo version: **17** (local)
 - Base URL: `http://localhost:8069`
 - Database: `odoo`
-- User: `odoo`
-- Password: `odoo`
+- User: `admin`
+- Password: `admin`
 - Multi-company enabled with 3 companies: **Rwanda**, **Uganda**, **Kenya**
 
 ### Required Odoo modules
